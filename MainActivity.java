@@ -12,13 +12,18 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.AlarmClock;
 import android.provider.ContactsContract.CommonDataKinds.Phone;
+import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.Voice;
 import android.text.InputType;
 import android.view.Gravity;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -47,6 +52,16 @@ import java.util.regex.Pattern;
 public class MainActivity extends Activity {
     private static final int SPEECH = 1;
     private static final int PERMISSIONS = 2;
+    private static final int MIC = 3;
+    private static final String BACKUP_MODEL = "gemini-3.1-flash-lite";
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable listenTask = this::listenHandsFree;
+    private SpeechRecognizer recognizer;
+    private Button handsFreeButton;
+    private boolean handsFree;
+    private boolean resumed;
+    private boolean listening;
+    private long followUpUntil;
     private static final String DEFAULT_MODEL = "gemini-flash-latest";
     private final JSONArray history = new JSONArray();
     private SharedPreferences prefs;
@@ -78,6 +93,11 @@ public class MainActivity extends Activity {
         layout.addView(screen);
         layout.addView(mic);
 
+        handsFreeButton = new Button(this);
+        handsFreeButton.setText("Hands-free: OFF");
+        handsFreeButton.setOnClickListener(v -> setHandsFree(!handsFree));
+        layout.addView(handsFreeButton);
+
         Button voice = new Button(this);
         voice.setText("Voice badlo");
         voice.setOnClickListener(v -> chooseVoice());
@@ -102,12 +122,122 @@ public class MainActivity extends Activity {
         requestMissingPermissions();
     }
 
-    private void listen() {
+    private void setHandsFree(boolean on) {
+        if (on && !granted(Manifest.permission.RECORD_AUDIO)) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, MIC);
+            return;
+        }
+        if (on && !SpeechRecognizer.isRecognitionAvailable(this)) {
+            say("Is phone pe hands free voice input nahi mila.");
+            return;
+        }
+        handsFree = on;
+        handsFreeButton.setText(on ? "Hands-free: ON" : "Hands-free: OFF");
+        if (on) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            say("Hands free on. Say Jarvis, followed by your command.");
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            stopListening();
+        }
+    }
+
+    private void scheduleListen(long delay) {
+        handler.removeCallbacks(listenTask);
+        if (handsFree && resumed) handler.postDelayed(listenTask, delay);
+    }
+
+    private void stopListening() {
+        handler.removeCallbacks(listenTask);
+        listening = false;
+        if (recognizer != null) {
+            recognizer.destroy();
+            recognizer = null;
+        }
+    }
+
+    private void listenHandsFree() {
+        if (!handsFree || !resumed || listening) return;
+        // Wait so Jarvis does not hear its own voice.
+        if (busy || tts.isSpeaking()) {
+            scheduleListen(500);
+            return;
+        }
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            recognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onResults(Bundle results) {
+                    listening = false;
+                    ArrayList<String> heard =
+                            results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (heard != null && !heard.isEmpty()) wake(heard.get(0));
+                    scheduleListen(800);
+                }
+                @Override public void onError(int error) {
+                    stopListening();
+                    if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                        setHandsFree(false);
+                        screen.setText("Mic permission check karo.");
+                    } else {
+                        scheduleListen(1000);
+                    }
+                }
+                @Override public void onReadyForSpeech(Bundle params) { }
+                @Override public void onBeginningOfSpeech() { }
+                @Override public void onRmsChanged(float level) { }
+                @Override public void onBufferReceived(byte[] buffer) { }
+                @Override public void onEndOfSpeech() { }
+                @Override public void onPartialResults(Bundle partial) { }
+                @Override public void onEvent(int type, Bundle params) { }
+            });
+        }
+        listening = true;
+        recognizer.startListening(speechIntent());
+    }
+
+    private void wake(String heard) {
+        String lower = heard.toLowerCase(Locale.ROOT);
+        boolean named = lower.contains("jarvis");
+        if (!named && System.currentTimeMillis() > followUpUntil) return;
+        followUpUntil = 0;
+        String command = lower.replaceAll("\\b(hey |hi |ok )?jarvis\\b", " ").trim();
+        if (command.isEmpty()) {
+            followUpUntil = System.currentTimeMillis() + 15000;
+            say("Yes, Sir?");
+        } else if (command.equals("stop") || command.equals("bas") || command.equals("chup")) {
+            say("Very well, Sir.");
+        } else if (prefs.getString("key", "").isEmpty()) {
+            handle(command);
+        } else {
+            askAi(command);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        resumed = true;
+        scheduleListen(1000);
+    }
+
+    @Override
+    protected void onPause() {
+        resumed = false;
+        stopListening();
+        super.onPause();
+    }
+
+    private Intent speechIntent() {
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN");
+        return i;
+    }
+
+    private void listen() {
+        tts.stop();
         try {
-            startActivityForResult(i, SPEECH);
+            startActivityForResult(speechIntent(), SPEECH);
         } catch (Exception e) {
             say("Voice input nahi mila. Google app install ya enable karo.");
         }
@@ -273,6 +403,11 @@ public class MainActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        if (request == MIC) {
+            if (granted(Manifest.permission.RECORD_AUDIO)) setHandsFree(true);
+            else say("Mic permission ke bina hands free nahi chalega");
+            return;
+        }
         if (request != PERMISSIONS || pendingName == null) return;
         String name = pendingName;
         pendingName = null;
@@ -322,7 +457,7 @@ public class MainActivity extends Activity {
         }
         new Thread(() -> {
             try {
-                String answer = post(model, key, body);
+                String answer = postWithRetry(model, key, body);
                 runOnUiThread(() -> finishAi(userTurn, answer));
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -336,6 +471,25 @@ public class MainActivity extends Activity {
     private JSONObject turn(String role, String text) throws Exception {
         return new JSONObject().put("role", role)
                 .put("parts", new JSONArray().put(new JSONObject().put("text", text)));
+    }
+
+    private String postWithRetry(String model, String key, String body) throws Exception {
+        try {
+            return post(model, key, body);
+        } catch (BusyException first) {
+            Thread.sleep(2000);
+            try {
+                return post(model, key, body);
+            } catch (BusyException second) {
+                return post(BACKUP_MODEL, key, body);
+            }
+        }
+    }
+
+    private static class BusyException extends Exception {
+        BusyException() {
+            super("Google AI abhi busy hai, thodi der baad try karo.");
+        }
     }
 
     private String post(String model, String key, String body) throws Exception {
@@ -354,6 +508,7 @@ public class MainActivity extends Activity {
             }
             int code = c.getResponseCode();
             if (code == 429) throw new Exception("Free limit khatam, thodi der baad try karo.");
+            if (code == 500 || code == 503) throw new BusyException();
             if (code != 200) throw new Exception("Error " + code + ". API key aur model name check karo.");
             String raw;
             try (InputStream in = c.getInputStream();
@@ -383,6 +538,7 @@ public class MainActivity extends Activity {
             while (history.length() > 12) history.remove(0);
             String words = reply.optString("say");
             String arg = reply.optString("arg");
+            followUpUntil = System.currentTimeMillis() + 30000;
             say(words);
             switch (reply.optString("action")) {
                 case "call":
@@ -482,11 +638,14 @@ public class MainActivity extends Activity {
 
     private void say(String message) {
         screen.setText(message);
+        stopListening();
         tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "jarvis");
+        scheduleListen(1500);
     }
 
     @Override
     protected void onDestroy() {
+        stopListening();
         tts.shutdown();
         super.onDestroy();
     }
