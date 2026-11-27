@@ -1,0 +1,13 @@
+plugins { id 'com.android.application' version '8.5.2' }
+
+android {
+    namespace 'com.sanchit.jarvis'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.sanchit.jarvis'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+}
